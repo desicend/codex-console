@@ -17,6 +17,32 @@ from ..config.constants import OTP_CODE_PATTERN
 logger = logging.getLogger(__name__)
 
 
+def _normalize_code(code: Any) -> str:
+    return str(code or "").strip()
+
+
+def _safe_parse_timestamp(value: Any) -> Optional[float]:
+    if value is None:
+        return None
+    try:
+        ts = float(value)
+        if ts > 1e12:
+            ts = ts / 1000.0
+        return ts
+    except Exception:
+        pass
+    try:
+        text = str(value or "").strip()
+        if not text:
+            return None
+        if text.endswith("Z"):
+            text = text[:-1] + "+00:00"
+        import datetime as _dt
+        return _dt.datetime.fromisoformat(text).timestamp()
+    except Exception:
+        return None
+
+
 class FreemailService(BaseEmailService):
     """
     Freemail 邮箱服务
@@ -184,6 +210,7 @@ class FreemailService(BaseEmailService):
         timeout: int = 120,
         pattern: str = OTP_CODE_PATTERN,
         otp_sent_at: Optional[float] = None,
+        exclude_codes: Optional[set[str]] = None,
     ) -> Optional[str]:
         """
         从 Freemail 邮箱获取验证码
@@ -193,7 +220,7 @@ class FreemailService(BaseEmailService):
             email_id: 未使用，保留接口兼容
             timeout: 超时时间（秒）
             pattern: 验证码正则
-            otp_sent_at: OTP 发送时间戳（暂未使用）
+            otp_sent_at: OTP 发送时间戳，用于过滤旧邮件
 
         Returns:
             验证码字符串，超时返回 None
@@ -202,6 +229,9 @@ class FreemailService(BaseEmailService):
 
         start_time = time.time()
         seen_mail_ids: set = set()
+        exclude_codes = {_normalize_code(c) for c in (exclude_codes or set()) if _normalize_code(c)}
+        if exclude_codes:
+            logger.debug("Freemail 调试: mailbox=%s otp_sent_at=%s exclude_count=%s", email, otp_sent_at, len(exclude_codes))
 
         while time.time() - start_time < timeout:
             try:
@@ -215,6 +245,18 @@ class FreemailService(BaseEmailService):
                     if not mail_id or mail_id in seen_mail_ids:
                         continue
 
+                    if otp_sent_at:
+                        msg_ts = (
+                            _safe_parse_timestamp(mail.get("timestamp"))
+                            or _safe_parse_timestamp(mail.get("date"))
+                            or _safe_parse_timestamp(mail.get("created_at"))
+                            or _safe_parse_timestamp(mail.get("createdAt"))
+                            or _safe_parse_timestamp(mail.get("received_at"))
+                            or _safe_parse_timestamp(mail.get("receivedAt"))
+                        )
+                        if msg_ts is not None and msg_ts + 600 < float(otp_sent_at):
+                            logger.debug("跳过 Freemail 旧邮件: id=%s ts=%s otp_sent_at=%s", mail_id, msg_ts, otp_sent_at)
+
                     seen_mail_ids.add(mail_id)
 
                     sender = str(mail.get("sender", "")).lower()
@@ -223,20 +265,28 @@ class FreemailService(BaseEmailService):
                     
                     content = f"{sender}\n{subject}\n{preview}"
                     
-                    if "openai" not in content.lower():
+                    lowered = content.lower()
+                    if not any(token in lowered for token in ("openai", "chatgpt", "tm1.openai.com", "tm.openai.com", "otp@", "noreply@tm.openai.com")):
                         continue
 
                     # 尝试直接使用 Freemail 提取的验证码
                     v_code = mail.get("verification_code")
                     if v_code:
+                        normalized_v_code = _normalize_code(v_code)
+                        if normalized_v_code in exclude_codes:
+                            logger.debug(f"跳过 Freemail 旧验证码: {v_code}")
+                            continue
                         logger.info(f"从 Freemail 邮箱 {email} 找到验证码: {v_code}")
                         self.update_status(True)
-                        return v_code
+                        return normalized_v_code
 
                     # 如果没有直接提供，通过正则匹配 preview
                     match = re.search(pattern, content)
                     if match:
-                        code = match.group(1)
+                        code = _normalize_code(match.group(1))
+                        if code in exclude_codes:
+                            logger.debug(f"跳过 Freemail 旧验证码: {code}")
+                            continue
                         logger.info(f"从 Freemail 邮箱 {email} 找到验证码: {code}")
                         self.update_status(True)
                         return code
@@ -247,7 +297,10 @@ class FreemailService(BaseEmailService):
                         full_content = str(detail.get("content", "")) + "\n" + str(detail.get("html_content", ""))
                         match = re.search(pattern, full_content)
                         if match:
-                            code = match.group(1)
+                            code = _normalize_code(match.group(1))
+                            if code in exclude_codes:
+                                logger.debug(f"跳过 Freemail 旧验证码: {code}")
+                                continue
                             logger.info(f"从 Freemail 邮箱 {email} 找到验证码: {code}")
                             self.update_status(True)
                             return code
